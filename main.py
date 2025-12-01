@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, List, Literal
 
 import httpx
 from fastapi import FastAPI
@@ -35,9 +35,8 @@ app.add_middleware(
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_LANG = os.getenv("AID_DEFAULT_LANG", "es")
 
-
 # ============================================================
-#   MODELOS DE PETICIÓN / RESPUESTA
+#   MODELOS DE PETICIÓN / RESPUESTA (ENDPOINT /chat)
 # ============================================================
 
 class ChatRequest(BaseModel):
@@ -70,12 +69,12 @@ def root():
 
 
 # ============================================================
-#   FUNCIÓN AUXILIAR: LLAMADA AL MODELO DE IA
+#   FUNCIÓN AUXILIAR: LLAMADA AL MODELO DE IA (para /chat)
 # ============================================================
 
 async def call_llm(prompt: str, language: str) -> Optional[str]:
     """
-    Llama al modelo de OpenAI.
+    Llama al modelo de OpenAI usando la API HTTP.
     Devuelve el texto generado, o None si algo falla (para usar fallback).
     """
     if not OPENAI_API_KEY:
@@ -116,7 +115,7 @@ async def call_llm(prompt: str, language: str) -> Optional[str]:
 
 
 # ============================================================
-#   ENDPOINT PRINCIPAL /chat
+#   ENDPOINT PRINCIPAL /chat  (para pruebas generales)
 # ============================================================
 
 @app.post("/chat", response_model=ChatResponse)
@@ -163,7 +162,7 @@ async def chat(request: ChatRequest):
 
 
 # ============================================================
-#   WIDGET HTML INCRUSTADO (SERVIDO POR FASTAPI)
+#   WIDGET HTML INCRUSTADO (SERVIDO POR FASTAPI)  (/widget)
 # ============================================================
 
 WIDGET_HTML = """
@@ -399,3 +398,77 @@ WIDGET_HTML = """
 @app.get("/widget", response_class=HTMLResponse)
 async def widget():
     return HTMLResponse(content=WIDGET_HTML)
+
+
+# ============================================================
+#   ENDPOINT PARA WIDGET / WEBSITE  (/api/aid-chat)
+# ============================================================
+
+class WidgetMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class WidgetChatRequest(BaseModel):
+    system_prompt: str
+    messages: List[WidgetMessage]
+
+
+class WidgetChatResponse(BaseModel):
+    reply: str
+
+
+@app.post("/api/aid-chat", response_model=WidgetChatResponse)
+async def aid_chat(request: WidgetChatRequest):
+    """
+    Endpoint pensado para el chatbot flotante del sitio o para Ad.AI.
+
+    El front envía:
+      - system_prompt: instrucciones del asistente (tono, rol, etc.)
+      - messages: historial de conversación (user/assistant)
+
+    Aquí construimos la request a OpenAI usando esos datos.
+    """
+
+    if not OPENAI_API_KEY:
+        # Fallback rápido si no hay API key configurada
+        return WidgetChatResponse(
+            reply=(
+                "Ahora mismo AI.D no tiene configurada la clave de OpenAI. "
+                "Pídele al equipo que revise la variable OPENAI_API_KEY en el servidor."
+            )
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    # Construimos la lista de mensajes para OpenAI
+    openai_messages = [{"role": "system", "content": request.system_prompt}]
+    for m in request.messages:
+        openai_messages.append({"role": m.role, "content": m.content})
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": openai_messages,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        data = r.json()
+        reply = data["choices"][0]["message"]["content"].strip()
+        return WidgetChatResponse(reply=reply)
+    except Exception:
+        return WidgetChatResponse(
+            reply=(
+                "No pude conectar con el modelo de IA en este momento. "
+                "Si necesitas ayuda urgente, te recomiendo contactar directamente con MKT 360."
+            )
+        )
