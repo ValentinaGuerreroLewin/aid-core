@@ -656,3 +656,147 @@ No incluyas comentarios ni explicación fuera del JSON.
             creatives=[],
             ctas=[],
         )
+
+
+# ============================================================
+#   ENDPOINT ESPECIALIZADO: ANALIZADOR DE CONTENIDO (/api/content/analyzer)
+# ============================================================
+
+class ContentAnalyzerRequest(BaseModel):
+    platform: Literal["instagram", "linkedin", "tiktok", "facebook", "youtube", "generic"]
+    content_text: Optional[str] = None          # caption, texto del post, descripción del video
+    url: Optional[str] = None                   # enlace al post (opcional)
+    keywords: Optional[List[str]] = None        # palabras clave esperadas
+    language: Optional[str] = None              # idioma deseado para la respuesta
+
+
+class ContentAnalyzerResponse(BaseModel):
+    summary: str
+    strengths: List[str]
+    weaknesses: List[str]
+    recommendations: List[str]
+    optimized_caption: str
+    keyword_gaps: List[str]
+    performance_score: int
+    ad_recommendation: str
+
+
+@app.post("/api/content/analyzer", response_model=ContentAnalyzerResponse)
+async def content_analyzer(request: ContentAnalyzerRequest):
+    """
+    Analiza contenido de redes sociales y devuelve:
+      - diagnóstico
+      - fortalezas
+      - debilidades
+      - qué mejorar
+      - caption optimizado
+      - palabras clave faltantes
+      - puntaje probable de rendimiento (1–100)
+      - recomendación de si sirve para publicidad
+    """
+
+    lang = request.language or DEFAULT_LANG or "es"
+
+    if not OPENAI_API_KEY:
+        return ContentAnalyzerResponse(
+            summary="AI.D no tiene clave de OpenAI configurada.",
+            strengths=[],
+            weaknesses=[],
+            recommendations=[],
+            optimized_caption="",
+            keyword_gaps=[],
+            performance_score=0,
+            ad_recommendation="No disponible."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    user_prompt = f"""
+Analiza el siguiente contenido para la plataforma: {request.platform}.
+Idioma de respuesta: {lang}.
+
+Contenido del usuario:
+{request.content_text or "Sin texto entregado."}
+
+URL asociada (si aplica): {request.url or "No proporcionada"}
+
+Palabras clave esperadas: {", ".join(request.keywords) if request.keywords else "Ninguna"}
+
+Devuelve SIEMPRE un JSON válido con esta estructura:
+
+{{
+  "summary": "Diagnóstico del contenido en máximo 3 líneas.",
+  "strengths": ["fortaleza 1", "fortaleza 2"],
+  "weaknesses": ["debilidad 1", "debilidad 2"],
+  "recommendations": ["recomendación 1", "recomendación 2"],
+  "optimized_caption": "Caption reescrito y optimizado para alcance y conversión.",
+  "keyword_gaps": ["keyword faltante 1"],
+  "performance_score": 0-100,
+  "ad_recommendation": "Explica si este contenido sirve para publicidad y por qué."
+}}
+
+No agregues texto fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Eres AI.D, analista senior de contenido para marketing digital y publicidad."
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+
+        # Intentamos parsear el JSON estrictamente
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            # Si falla el parseo, devolvemos texto libre en campos básicos
+            return ContentAnalyzerResponse(
+                summary="Resultado sin formato JSON:",
+                strengths=[],
+                weaknesses=[],
+                recommendations=[],
+                optimized_caption=raw,
+                keyword_gaps=[],
+                performance_score=0,
+                ad_recommendation="No se pudo evaluar."
+            )
+
+        return ContentAnalyzerResponse(
+            summary=str(parsed.get("summary", "")),
+            strengths=[str(s) for s in parsed.get("strengths", [])],
+            weaknesses=[str(s) for s in parsed.get("weaknesses", [])],
+            recommendations=[str(s) for s in parsed.get("recommendations", [])],
+            optimized_caption=str(parsed.get("optimized_caption", "")),
+            keyword_gaps=[str(k) for k in parsed.get("keyword_gaps", [])],
+            performance_score=int(parsed.get("performance_score", 0)),
+            ad_recommendation=str(parsed.get("ad_recommendation", "")),
+        )
+
+    except Exception:
+        return ContentAnalyzerResponse(
+            summary="Error al conectar con la IA.",
+            strengths=[],
+            weaknesses=[],
+            recommendations=[],
+            optimized_caption="",
+            keyword_gaps=[],
+            performance_score=0,
+            ad_recommendation="No disponible."
+        )
