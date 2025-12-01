@@ -1,4 +1,5 @@
 import os
+import json
 from typing import Optional, List, Literal
 
 import httpx
@@ -426,8 +427,6 @@ async def aid_chat(request: WidgetChatRequest):
     El front envía:
       - system_prompt: instrucciones del asistente (tono, rol, etc.)
       - messages: historial de conversación (user/assistant)
-
-    Aquí construimos la request a OpenAI usando esos datos.
     """
 
     if not OPENAI_API_KEY:
@@ -471,4 +470,189 @@ async def aid_chat(request: WidgetChatRequest):
                 "No pude conectar con el modelo de IA en este momento. "
                 "Si necesitas ayuda urgente, te recomiendo contactar directamente con MKT 360."
             )
+        )
+
+
+# ============================================================
+#   ENDPOINT ESPECIALIZADO: OPTIMIZADOR DE CAMPAÑAS (/api/ads/optimizer)
+# ============================================================
+
+class BudgetSplit(BaseModel):
+    platform: str
+    percentage: float
+
+
+class AdsOptimizerRequest(BaseModel):
+    business_name: Optional[str] = None
+    business_type: str          # ej: "clases de boxeo", "ecommerce de ropa"
+    country: str                # ej: "Chile", "Estados Unidos"
+    objective: Literal["awareness", "leads", "sales", "traffic", "mixed"]
+    monthly_budget: float
+    currency: str = "USD"
+    platforms: List[str]        # ej: ["Instagram Ads", "Facebook Ads", "Google Ads"]
+    notes: Optional[str] = None
+    language: Optional[str] = None
+
+
+class AdsOptimizerResponse(BaseModel):
+    summary: str
+    recommended_strategy: str
+    budget_distribution: List[BudgetSplit]
+    audiences: List[str]
+    creatives: List[str]
+    ctas: List[str]
+
+
+@app.post("/api/ads/optimizer", response_model=AdsOptimizerResponse)
+async def ads_optimizer(request: AdsOptimizerRequest):
+    """
+    Endpoint especializado para que AI.D actúe como planner de campañas.
+
+    Devuelve:
+      - resumen del caso
+      - estrategia recomendada
+      - distribución de presupuesto por plataforma
+      - ideas de audiencias
+      - ideas de creatividades
+      - CTAs sugeridos
+    """
+
+    lang = request.language or DEFAULT_LANG or "es"
+
+    if not OPENAI_API_KEY:
+        # Fallback rápido si no hay API key configurada
+        return AdsOptimizerResponse(
+            summary=(
+                "AI.D no tiene configurada la clave de OpenAI en el servidor. "
+                "Configura OPENAI_API_KEY para activar el optimizador de campañas."
+            ),
+            recommended_strategy="",
+            budget_distribution=[],
+            audiences=[],
+            creatives=[],
+            ctas=[],
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    business_name = request.business_name or "Sin nombre específico"
+    notes = request.notes or "Sin notas adicionales."
+
+    platforms_str = ", ".join(request.platforms)
+
+    system_prompt = (
+        "Eres AI.D, planner senior de medios digitales con más de 15 años de experiencia "
+        "en campañas para PYMEs y emprendedores. "
+        "Tu trabajo es proponer una estrategia clara, realista y accionable."
+    )
+
+    user_prompt = f"""
+Idioma de respuesta: {lang}.
+
+Datos del negocio:
+- Nombre: {business_name}
+- Tipo de negocio: {request.business_type}
+- País: {request.country}
+- Objetivo principal: {request.objective}
+- Presupuesto mensual: {request.monthly_budget} {request.currency}
+- Plataformas disponibles: {platforms_str}
+- Notas extra: {notes}
+
+Devuelve SIEMPRE un JSON válido (sin texto antes ni después) con esta estructura:
+
+{{
+  "summary": "Resumen breve del caso y del objetivo en máximo 4 líneas.",
+  "recommended_strategy": "Estrategia explicada en 6–10 líneas, en lenguaje simple, realista y accionable.",
+  "budget_distribution": [
+    {{ "platform": "Instagram Ads", "percentage": 50 }},
+    {{ "platform": "Facebook Ads", "percentage": 30 }},
+    {{ "platform": "Google Ads", "percentage": 20 }}
+  ],
+  "audiences": [
+    "Descripción de audiencia 1",
+    "Descripción de audiencia 2"
+  ],
+  "creatives": [
+    "Idea de creatividad 1",
+    "Idea de creatividad 2"
+  ],
+  "ctas": [
+    "Llamado a la acción 1",
+    "Llamado a la acción 2"
+  ]
+}}
+
+Asegúrate de que la suma de los porcentajes de budget_distribution sea aproximadamente 100.
+No incluyas comentarios ni explicación fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        data = r.json()
+        raw_content = data["choices"][0]["message"]["content"]
+
+        try:
+            parsed = json.loads(raw_content)
+        except Exception:
+            # Si no se puede parsear el JSON, devolvemos algo básico
+            return AdsOptimizerResponse(
+                summary="Propuesta de estrategia (texto libre):",
+                recommended_strategy=raw_content,
+                budget_distribution=[],
+                audiences=[],
+                creatives=[],
+                ctas=[],
+            )
+
+        # Normalizamos budget_distribution
+        budget_list = []
+        for item in parsed.get("budget_distribution", []):
+            try:
+                budget_list.append(
+                    BudgetSplit(
+                        platform=str(item.get("platform", "Sin plataforma")),
+                        percentage=float(item.get("percentage", 0)),
+                    )
+                )
+            except Exception:
+                continue
+
+        return AdsOptimizerResponse(
+            summary=str(parsed.get("summary", "")),
+            recommended_strategy=str(parsed.get("recommended_strategy", "")),
+            budget_distribution=budget_list,
+            audiences=[str(a) for a in parsed.get("audiences", [])],
+            creatives=[str(c) for c in parsed.get("creatives", [])],
+            ctas=[str(c) for c in parsed.get("ctas", [])],
+        )
+
+    except Exception:
+        # Fallback si falla toda la llamada
+        return AdsOptimizerResponse(
+            summary=(
+                "No se pudo conectar con el modelo de IA para generar la estrategia. "
+                "Intenta de nuevo en unos minutos o revisa la configuración de la API."
+            ),
+            recommended_strategy="",
+            budget_distribution=[],
+            audiences=[],
+            creatives=[],
+            ctas=[],
         )
