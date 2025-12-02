@@ -1,6 +1,6 @@
 import os
 import json
-from typing import Optional, List, Literal
+from typing import Optional, List, Literal, Tuple
 
 import httpx
 from fastapi import FastAPI
@@ -35,6 +35,196 @@ app.add_middleware(
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_LANG = os.getenv("AID_DEFAULT_LANG", "es")
+
+# ============================================================
+#   LISTA DE PALABRAS FUERTES PARA STOP SCROLL (HEURÍSTICA)
+# ============================================================
+
+STRONG_WORDS = [
+    "error",
+    "errores",
+    "secreto",
+    "secretos",
+    "sistema",
+    "sistemas",
+    "ventas",
+    "venta",
+    "crecer",
+    "growth",
+    "escala",
+    "escala tu negocio",
+    "automatizar",
+    "automatización",
+    "automatizacion",
+    "funnel",
+    "embudo",
+    "plan",
+    "plan claro",
+    "resultado",
+    "resultados",
+    "clientes reales",
+    "conversiones",
+    "conversión",
+    "conversión real",
+    "diagnóstico",
+    "diagnostico",
+    "audit",
+    "auditoría",
+    "auditoria",
+]
+
+def _word_count(text: str) -> int:
+    return len([w for w in text.strip().split() if w])
+
+def _count_strong_words(text: str) -> int:
+    lower = text.lower()
+    count = 0
+    for w in STRONG_WORDS:
+        if w in lower:
+            count += 1
+    return count
+
+def _evaluate_scroll_stop(topic: str, platform: str) -> Tuple[int, List[str]]:
+    """
+    Heurística simple para estimar qué tanto 'stop scroll' tiene un hook/tema
+    según longitud, presencia de números, preguntas, palabras fuertes, etc.
+    """
+    details: List[str] = []
+    text = (topic or "").strip()
+    words = _word_count(text)
+
+    if words == 0:
+        details.append("No hay texto para evaluar. Escribe al menos una frase clara.")
+        return 0, details
+
+    has_number = any(ch.isdigit() for ch in text)
+    has_question = "?" in text or "¿" in text
+    strong_count = _count_strong_words(text)
+    lower = text.lower()
+
+    score = 0
+
+    # 1) Longitud del hook
+    if 4 <= words <= 10:
+        score += 25
+        details.append("✅ Longitud clara (4–10 palabras). Buen ritmo para detener scroll.")
+    elif 2 <= words <= 14:
+        score += 15
+        details.append("🟡 Longitud aceptable, pero podría ser más directa.")
+    else:
+        score += 5
+        details.append("⚠️ Hook muy largo o muy corto. Resta fuerza al stop scroll.")
+
+    # 2) Números o datos concretos
+    if has_number:
+        score += 10
+        details.append("✅ Incluye números/datos (ej. '3 pasos', '7 días'), esto suele captar atención.")
+    else:
+        details.append("🟡 No hay números ni datos concretos. Podrías sumar 'X pasos', 'Y días', etc.")
+
+    # 3) Forma de pregunta
+    if has_question:
+        score += 10
+        details.append("✅ Está formulado como pregunta. Invita a frenar el scroll para responder mentalmente.")
+    else:
+        details.append("🟡 No es una pregunta. A veces una pregunta directa aumenta el stop scroll.")
+
+    # 4) Palabras fuertes
+    if strong_count >= 2:
+        score += 18
+        details.append("✅ Usa varias palabras fuertes (errores, sistema, resultados, etc.).")
+    elif strong_count == 1:
+        score += 10
+        details.append("🟡 Usa al menos una palabra fuerte. Podrías reforzar con otra más.")
+    else:
+        score += 4
+        details.append("⚠️ Falta vocabulario que active decisión (errores, sistema, resultados...).")
+
+    # 5) Claridad global (tamaño total)
+    if words <= 18:
+        score += 12
+        details.append("✅ Frase relativamente corta. Se lee en un vistazo en el feed.")
+    elif words <= 25:
+        score += 6
+        details.append("🟡 Un poco larga. Podría perder fuerza en pantallas móviles.")
+    else:
+        score += 2
+        details.append("⚠️ Demasiado texto para un primer impacto. Conviene recortar.")
+
+    # 6) CTA suave dentro del texto
+    soft_cta = any(
+        kw in lower
+        for kw in [
+            "comenta",
+            "escribe",
+            "pídeme",
+            "pideme",
+            "quieres",
+            "descubre",
+            "aprende",
+            "guarda",
+            "save",
+        ]
+    )
+    if soft_cta:
+        score += 8
+        details.append("✅ Hay un llamado suave a la acción (CTA) dentro del hook.")
+    else:
+        details.append("🟡 No se percibe un CTA claro. Recuerda la mecánica de palabra clave.")
+
+    # 7) Ajuste por plataforma
+    if platform in ["instagram", "tiktok", "threads", "youtube"]:
+        if words <= 14:
+            score += 8
+            details.append("✅ Buen tamaño para feeds rápidos (Instagram, TikTok, Threads, Shorts).")
+        else:
+            score -= 5
+            details.append("⚠️ Para Instagram/TikTok/Threads conviene algo más corto y directo.")
+    elif platform == "linkedin":
+        if 6 <= words <= 18:
+            score += 6
+            details.append("✅ Para LinkedIn, buen equilibrio entre claridad y contexto.")
+        elif words < 6:
+            details.append("🟡 En LinkedIn puedes sumar un poco más de contexto estratégico.")
+
+    # Normalizar 0–100
+    if score < 0:
+        score = 0
+    if score > 100:
+        score = 100
+
+    return score, details
+
+def _scroll_level(score: int) -> str:
+    if score >= 80:
+        return "ALTO"
+    if score >= 55:
+        return "MEDIO"
+    return "BAJO"
+
+def _scroll_advice(score: int, platform: str) -> str:
+    if platform == "linkedin":
+        base = "LinkedIn premia claridad, datos y contexto de negocio. "
+    else:
+        base = "Esta red premia hooks claros, emocionales y muy directos. "
+
+    if score >= 80:
+        return (
+            base
+            + "Este tema tiene muy buen potencial de detener el scroll. Puedes pasar a estructurar el resto del post "
+              "(caption, slides o guion) y definir tu palabra clave del funnel."
+        )
+    if score >= 55:
+        return (
+            base
+            + "El stop scroll es aceptable, pero con 1–2 ajustes (hacerlo más corto, sumar un número o una promesa "
+              "concreta) podrías llevarlo a un nivel alto."
+        )
+    return (
+        base
+        + "El hook es débil para frenar el scroll. Conviene reformularlo: hazlo más corto, convierte la idea en "
+          "pregunta o agrega una promesa de resultado clara."
+    )
 
 # ============================================================
 #   MODELOS DE PETICIÓN / RESPUESTA (ENDPOINT /chat)
@@ -782,7 +972,7 @@ No agregues texto fuera del JSON.
             summary=str(parsed.get("summary", "")),
             strengths=[str(s) for s in parsed.get("strengths", [])],
             weaknesses=[str(s) for s in parsed.get("weaknesses", [])],
-            recommendations=[str(s) for s in parsed.get("recommendations", [])],
+            recommendations=[str(r) for r in parsed.get("recommendations", [])],
             optimized_caption=str(parsed.get("optimized_caption", "")),
             keyword_gaps=[str(k) for k in parsed.get("keyword_gaps", [])],
             performance_score=int(parsed.get("performance_score", 0)),
@@ -997,4 +1187,1235 @@ No escribas nada fuera del JSON.
             scroll_stopper_score=0,
             virality_probability="Desconocida",
             differentiation_level="Desconocido"
+        )
+
+
+# ============================================================
+#   NUEVO ENDPOINT: SCORE DE STOP SCROLL
+#   (/api/content/scroll-stop)
+# ============================================================
+
+class ScrollStopRequest(BaseModel):
+    platform: Literal["instagram", "linkedin", "tiktok", "threads", "facebook", "youtube", "generic"]
+    topic: str
+    language: Optional[str] = None  # por si más adelante quieres respuestas en inglés
+
+
+class ScrollStopResponse(BaseModel):
+    score: int
+    level: str            # "ALTO", "MEDIO", "BAJO"
+    details: List[str]    # explicación paso a paso
+    advice: str           # recomendación estratégica
+
+
+@app.post("/api/content/scroll-stop", response_model=ScrollStopResponse)
+async def scroll_stop(request: ScrollStopRequest):
+    """
+    Calcula de forma rápida (sin modelo de IA) qué tanto 'stop scroll'
+    tiene un tema/hook en función de:
+      - longitud
+      - números/datos
+      - pregunta o no
+      - palabras fuertes
+      - CTA dentro del texto
+      - plataforma elegida
+
+    Sirve para LinkedIn, Instagram, Threads, TikTok, Facebook, YouTube, etc.
+    """
+
+    lang = request.language or DEFAULT_LANG or "es"
+    platform = request.platform
+    topic = request.topic or ""
+
+    score, details = _evaluate_scroll_stop(topic, platform)
+    level = _scroll_level(score)
+    advice = _scroll_advice(score, platform)
+
+    # (Por ahora solo damos respuesta en español, aunque uses 'en' como lang)
+    return ScrollStopResponse(
+        score=int(score),
+        level=level,
+        details=details,
+        advice=advice,
+    )
+
+
+# ============================================================
+#   A) ENDPOINT: OPTIMIZADOR DE HOOKS
+#   (/api/content/hook-optimizer)
+# ============================================================
+
+class HookOptimizerRequest(BaseModel):
+    platform: Literal["instagram", "linkedin", "tiktok", "threads", "facebook", "youtube", "generic"]
+    hook: str
+    objective: Literal["awareness", "engagement", "leads", "sales", "authority", "mixed"] = "awareness"
+    language: Optional[str] = None
+
+
+class HookOptimizerResponse(BaseModel):
+    original_hook: str
+    original_score: int
+    original_level: str
+    improved_hook: str
+    improved_score: int
+    improved_level: str
+    variants: List[str]
+    explanation: str
+    recommended_format: str
+    suggested_keyword: str
+
+
+@app.post("/api/content/hook-optimizer", response_model=HookOptimizerResponse)
+async def hook_optimizer(request: HookOptimizerRequest):
+    """
+    Optimiza un hook/título corto para aumentar su capacidad de 'stop scroll'.
+    Combina heurística propia + modelo de IA (cuando esté disponible).
+    """
+
+    lang = request.language or DEFAULT_LANG or "es"
+    platform = request.platform
+    original_hook = request.hook.strip()
+
+    # Evaluamos hook original con la heurística
+    orig_score, _ = _evaluate_scroll_stop(original_hook, platform)
+    orig_level = _scroll_level(orig_score)
+
+    # Si no hay OPENAI_API_KEY, devolvemos versión básica sin IA
+    if not OPENAI_API_KEY:
+        return HookOptimizerResponse(
+            original_hook=original_hook,
+            original_score=int(orig_score),
+            original_level=orig_level,
+            improved_hook=original_hook,
+            improved_score=int(orig_score),
+            improved_level=orig_level,
+            variants=[],
+            explanation="AI.D está en modo sin modelo avanzado. Usa la heurística básica de stop scroll.",
+            recommended_format="Post estático",
+            suggested_keyword="SYSTEM",
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    user_prompt = f"""
+Plataforma: {platform}
+Objetivo: {request.objective}
+Idioma: {lang}
+
+Hook original:
+"{original_hook}"
+
+Genera SIEMPRE un JSON válido con esta estructura:
+
+{{
+  "improved_hook": "Versión optimizada del hook, máximo 7 palabras, muy claro y potente.",
+  "variants": [
+    "Variante alternativa 1",
+    "Variante alternativa 2",
+    "Variante alternativa 3"
+  ],
+  "explanation": "Explica en 3–5 líneas qué se mejoró (longitud, fuerza, claridad, CTA, etc.).",
+  "recommended_format": "Reel 30s / Carrusel 3 slides / Post estático",
+  "suggested_keyword": "PALABRA_CLAVE_CORTA para el funnel (ej. SYSTEM, AUDIT, GROWTH)."
+}}
+
+No escribas nada fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Eres AI.D, experto en hooks de alto rendimiento para redes sociales. "
+                    "Conoces a fondo el comportamiento de scroll en Instagram, LinkedIn, TikTok, Threads y YouTube. "
+                    "Tu misión es hacer los hooks más cortos, claros y potentes, alineados al funnel."
+                )
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            # Si falla el parseo, usamos el texto libre como explicación
+            return HookOptimizerResponse(
+                original_hook=original_hook,
+                original_score=int(orig_score),
+                original_level=orig_level,
+                improved_hook=original_hook,
+                improved_score=int(orig_score),
+                improved_level=orig_level,
+                variants=[],
+                explanation=f"No se pudo parsear el JSON. Respuesta cruda del modelo: {raw}",
+                recommended_format="Post estático",
+                suggested_keyword="SYSTEM",
+            )
+
+        improved_hook = str(parsed.get("improved_hook", original_hook)).strip()
+        variants = [str(v) for v in parsed.get("variants", [])]
+
+        # Evaluamos el hook mejorado con la misma heurística
+        imp_score, _ = _evaluate_scroll_stop(improved_hook, platform)
+        imp_level = _scroll_level(imp_score)
+
+        return HookOptimizerResponse(
+            original_hook=original_hook,
+            original_score=int(orig_score),
+            original_level=orig_level,
+            improved_hook=improved_hook,
+            improved_score=int(imp_score),
+            improved_level=imp_level,
+            variants=variants,
+            explanation=str(parsed.get("explanation", "")),
+            recommended_format=str(parsed.get("recommended_format", "")),
+            suggested_keyword=str(parsed.get("suggested_keyword", "")),
+        )
+
+    except Exception as e:
+        return HookOptimizerResponse(
+            original_hook=original_hook,
+            original_score=int(orig_score),
+            original_level=orig_level,
+            improved_hook=original_hook,
+            improved_score=int(orig_score),
+            improved_level=orig_level,
+            variants=[],
+            explanation=f"Error al conectar con el modelo de IA: {str(e)}",
+            recommended_format="Post estático",
+            suggested_keyword="SYSTEM",
+        )
+
+
+# ============================================================
+#   B) ENDPOINT: GENERADOR DE SLIDES (CARRUSEL)
+#   (/api/content/slide-generator)
+# ============================================================
+
+class SlideBlock(BaseModel):
+    index: int
+    title: str
+    body: str
+    cta: str
+
+
+class SlideGeneratorRequest(BaseModel):
+    platform: Literal["instagram", "linkedin"]
+    topic: str
+    phase: Literal["awareness", "consideration", "conversion", "retention"]
+    slides: int = 5
+    style: Literal["mkt360", "professional", "motivational", "direct", "friendly"] = "mkt360"
+    language: Optional[str] = None
+
+
+class SlideGeneratorResponse(BaseModel):
+    topic: str
+    phase: str
+    slides: List[SlideBlock]
+    global_caption: str
+    keyword: str
+    funnel_stage: str
+
+
+@app.post("/api/content/slide-generator", response_model=SlideGeneratorResponse)
+async def slide_generator(request: SlideGeneratorRequest):
+    """
+    Genera texto para carruseles siguiendo el Plan Clientes Nuevos.
+    Devuelve slides con título, cuerpo y CTA por slide + caption global.
+    """
+
+    if request.language:
+        lang = request.language
+    else:
+        # Por defecto: IG en español, LinkedIn en inglés
+        lang = "es" if request.platform == "instagram" else "en"
+
+    if not OPENAI_API_KEY:
+        # Fallback simple
+        fake_slide = SlideBlock(
+            index=1,
+            title="AI.D sin modelo configurado",
+            body="Configura la variable OPENAI_API_KEY en el servidor para activar el generador de slides.",
+            cta="Escribe SYSTEM para activar tu funnel."
+        )
+        return SlideGeneratorResponse(
+            topic=request.topic,
+            phase=request.phase,
+            slides=[fake_slide],
+            global_caption="AI.D aún no tiene modelo avanzado configurado.",
+            keyword="SYSTEM",
+            funnel_stage=request.phase,
+        )
+
+    if request.style == "mkt360":
+        tone = (
+            "Usa tono MKT 360: inteligente, rápido, profesional, cero vendehumo, con enfoque en sistemas y resultados."
+        )
+    elif request.style == "professional":
+        tone = "Tono profesional, claro y ejecutivo."
+    elif request.style == "motivational":
+        tone = "Tono motivador, inspirador pero concreto."
+    elif request.style == "direct":
+        tone = "Tono directo, sin rodeos."
+    else:
+        tone = "Tono cercano y amigable."
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    user_prompt = f"""
+Plataforma: {request.platform}
+Tema central del carrusel: {request.topic}
+Fase del funnel (Plan Clientes Nuevos): {request.phase}
+Número de slides: {request.slides}
+Idioma: {lang}
+
+Reglas:
+- Slide 1: impacto / problema / pregunta.
+- Slides intermedios: errores, explicación simple, comparativas o mini-caso según la fase.
+- Última slide: CTA claro + palabra clave única para el funnel.
+- Párrafos cortos (1–2 líneas).
+- Mantén el tono: {tone}
+
+Devuelve SIEMPRE un JSON válido con esta estructura:
+
+{{
+  "slides": [
+    {{
+      "index": 1,
+      "title": "Título slide 1",
+      "body": "Texto breve de la slide 1 (1–3 frases cortas).",
+      "cta": "CTA específico de esta slide o vacío si no aplica."
+    }}
+  ],
+  "global_caption": "Caption para acompañar el carrusel, con palabras clave y CTA final.",
+  "keyword": "PALABRA_CLAVE_CORTA (ej. SYSTEM, AUDIT, GROWTH).",
+  "funnel_stage": "awareness / consideration / conversion / retention"
+}}
+
+No agregues texto fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Eres AI.D, experto en creación de carruseles estratégicos siguiendo el Plan Clientes Nuevos. "
+                    "Estructuras slides claras, accionables y con CTA en línea con el funnel."
+                )
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=80.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            fake_slide = SlideBlock(
+                index=1,
+                title="Error al procesar JSON",
+                body=raw,
+                cta="Reintenta la petición."
+            )
+            return SlideGeneratorResponse(
+                topic=request.topic,
+                phase=request.phase,
+                slides=[fake_slide],
+                global_caption="No se pudo parsear la respuesta del modelo.",
+                keyword="SYSTEM",
+                funnel_stage=request.phase,
+            )
+
+        slides_list: List[SlideBlock] = []
+        for s in parsed.get("slides", []):
+            try:
+                slides_list.append(
+                    SlideBlock(
+                        index=int(s.get("index", len(slides_list) + 1)),
+                        title=str(s.get("title", "")),
+                        body=str(s.get("body", "")),
+                        cta=str(s.get("cta", "")),
+                    )
+                )
+            except Exception:
+                continue
+
+        if not slides_list:
+            slides_list.append(
+                SlideBlock(
+                    index=1,
+                    title="Sin slides generadas",
+                    body="No fue posible generar slides a partir de la respuesta del modelo.",
+                    cta="Reintenta la petición."
+                )
+            )
+
+        return SlideGeneratorResponse(
+            topic=request.topic,
+            phase=request.phase,
+            slides=slides_list,
+            global_caption=str(parsed.get("global_caption", "")),
+            keyword=str(parsed.get("keyword", "")),
+            funnel_stage=str(parsed.get("funnel_stage", request.phase)),
+        )
+
+    except Exception as e:
+        fake_slide = SlideBlock(
+            index=1,
+            title="Error de conexión con IA",
+            body=str(e),
+            cta="Reintenta la petición."
+        )
+        return SlideGeneratorResponse(
+            topic=request.topic,
+            phase=request.phase,
+            slides=[fake_slide],
+            global_caption="Hubo un error al conectar con el modelo de IA.",
+            keyword="SYSTEM",
+            funnel_stage=request.phase,
+        )
+
+
+# ============================================================
+#   C) ENDPOINT: MAPA DE FUNNEL / MINI SISTEMA
+#   (/api/content/funnel-map)
+# ============================================================
+
+class FunnelStage(BaseModel):
+    name: str
+    goal: str
+    content_role: str
+    message_example: str
+
+
+class FunnelMapRequest(BaseModel):
+    topic: str
+    platform: Literal["instagram", "linkedin", "tiktok", "facebook", "youtube", "generic"]
+    objective: Literal["awareness", "engagement", "leads", "sales", "mixed"] = "mixed"
+    language: Optional[str] = None
+
+
+class FunnelMapResponse(BaseModel):
+    topic: str
+    platform: str
+    objective: str
+    keyword: str
+    stages: List[FunnelStage]
+    auto_messages: List[str]
+    sequence_24h: List[str]
+    metrics_focus: List[str]
+
+
+@app.post("/api/content/funnel-map", response_model=FunnelMapResponse)
+async def funnel_map(request: FunnelMapRequest):
+    """
+    Genera un mini-embudo automático para un tema de contenido:
+    - palabra clave
+    - etapas (Awareness / Consideration / Conversion / Retention)
+    - mensajes automáticos
+    - secuencia sugerida de 24h
+    """
+
+    lang = request.language or DEFAULT_LANG or "es"
+
+    if not OPENAI_API_KEY:
+        return FunnelMapResponse(
+            topic=request.topic,
+            platform=request.platform,
+            objective=request.objective,
+            keyword="SYSTEM",
+            stages=[
+                FunnelStage(
+                    name="Awareness",
+                    goal="Llamar la atención sobre el problema principal.",
+                    content_role="Educar rápido y mostrar el error clave.",
+                    message_example="¿Quieres dejar de publicar sin ver resultados reales?"
+                )
+            ],
+            auto_messages=[
+                "Gracias por escribir SYSTEM. Cuéntame en una frase qué vendes y en qué país estás."
+            ],
+            sequence_24h=[
+                "T0h: Respuesta automática con preguntas clave.",
+                "T4h: Enviar recordatorio suave si no responde.",
+                "T24h: Cerrar con propuesta de diagnóstico express."
+            ],
+            metrics_focus=[
+                "Comentarios con palabra clave",
+                "Respuestas al mensaje automático",
+                "Diagnósticos completados"
+            ],
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    user_prompt = f"""
+Tema central del contenido: {request.topic}
+Plataforma: {request.platform}
+Objetivo principal: {request.objective}
+Idioma: {lang}
+
+Genera un mini-sistema tipo funnel basado en el Plan Clientes Nuevos.
+
+Devuelve SIEMPRE un JSON válido con esta estructura:
+
+{{
+  "keyword": "PALABRA_CLAVE_CORTA (ej. SYSTEM, AUDIT, GROWTH).",
+  "stages": [
+    {{
+      "name": "Awareness",
+      "goal": "Objetivo de esta etapa.",
+      "content_role": "Qué hace el contenido aquí.",
+      "message_example": "Ejemplo de mensaje / ángulo."
+    }},
+    {{
+      "name": "Consideration",
+      "goal": "...",
+      "content_role": "...",
+      "message_example": "..."
+    }},
+    {{
+      "name": "Conversion",
+      "goal": "...",
+      "content_role": "...",
+      "message_example": "..."
+    }},
+    {{
+      "name": "Retention",
+      "goal": "...",
+      "content_role": "...",
+      "message_example": "..."
+    }}
+  ],
+  "auto_messages": [
+    "Mensaje automático 1 cuando alguien comenta la palabra clave.",
+    "Mensaje automático 2 de seguimiento."
+  ],
+  "sequence_24h": [
+    "Paso 1 dentro de las primeras horas.",
+    "Paso 2...",
+    "Paso 3..."
+  ],
+  "metrics_focus": [
+    "Métrica 1",
+    "Métrica 2"
+  ]
+}}
+
+No incluyas texto fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Eres AI.D, arquitecto de funnels para PYMEs y emprendedores. "
+                    "Conviertes un solo contenido en un mini sistema comercial: atraer, activar, diagnosticar y cerrar."
+                )
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=80.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            # Fallback si el JSON viene mal
+            return FunnelMapResponse(
+                topic=request.topic,
+                platform=request.platform,
+                objective=request.objective,
+                keyword="SYSTEM",
+                stages=[
+                    FunnelStage(
+                        name="Error",
+                        goal="No se pudo parsear el JSON.",
+                        content_role="Revisa la respuesta cruda del modelo.",
+                        message_example=raw,
+                    )
+                ],
+                auto_messages=[],
+                sequence_24h=[],
+                metrics_focus=[],
+            )
+
+        stages_list: List[FunnelStage] = []
+        for s in parsed.get("stages", []):
+            try:
+                stages_list.append(
+                    FunnelStage(
+                        name=str(s.get("name", "")),
+                        goal=str(s.get("goal", "")),
+                        content_role=str(s.get("content_role", "")),
+                        message_example=str(s.get("message_example", "")),
+                    )
+                )
+            except Exception:
+                continue
+
+        if not stages_list:
+            stages_list.append(
+                FunnelStage(
+                    name="Awareness",
+                    goal="Iniciar el interés.",
+                    content_role="Educar rápido.",
+                    message_example="Descubre por qué tu contenido no convierte."
+                )
+            )
+
+        return FunnelMapResponse(
+            topic=request.topic,
+            platform=request.platform,
+            objective=request.objective,
+            keyword=str(parsed.get("keyword", "")),
+            stages=stages_list,
+            auto_messages=[str(m) for m in parsed.get("auto_messages", [])],
+            sequence_24h=[str(s) for s in parsed.get("sequence_24h", [])],
+            metrics_focus=[str(m) for m in parsed.get("metrics_focus", [])],
+        )
+
+    except Exception as e:
+        return FunnelMapResponse(
+            topic=request.topic,
+            platform=request.platform,
+            objective=request.objective,
+            keyword="SYSTEM",
+            stages=[
+                FunnelStage(
+                    name="Error",
+                    goal="Fallo de conexión con IA.",
+                    content_role="Mostrar detalle técnico.",
+                    message_example=str(e),
+                )
+            ],
+            auto_messages=[],
+            sequence_24h=[],
+            metrics_focus=[],
+        )
+
+
+# ============================================================
+#   D) ENDPOINT: PREDICTOR DE ANUNCIOS
+#   (/api/ads/predictor)
+# ============================================================
+
+class AdsPredictorRequest(BaseModel):
+    platform: Literal["instagram", "facebook", "tiktok", "linkedin", "youtube", "generic"]
+    objective: Literal["awareness", "traffic", "leads", "sales", "engagement"]
+    headline: str
+    primary_text: str
+    description: Optional[str] = None
+    cta: Optional[str] = None
+    daily_budget: float
+    currency: str = "USD"
+    language: Optional[str] = None
+
+
+class AdsPredictorResponse(BaseModel):
+    platform: str
+    objective: str
+    estimated_ctr: float
+    estimated_cpc: float
+    estimated_cpm: float
+    expected_result_summary: str
+    risk_level: str
+    recommendations: List[str]
+
+
+@app.post("/api/ads/predictor", response_model=AdsPredictorResponse)
+async def ads_predictor(request: AdsPredictorRequest):
+    """
+    Predice rendimiento estimado de un anuncio según texto + objetivo.
+    No reemplaza pruebas reales, pero da una estimación orientativa.
+    """
+
+    lang = request.language or DEFAULT_LANG or "es"
+
+    if not OPENAI_API_KEY:
+        # Valores ficticios conservadores
+        return AdsPredictorResponse(
+            platform=request.platform,
+            objective=request.objective,
+            estimated_ctr=1.0,
+            estimated_cpc=1.5,
+            estimated_cpm=8.0,
+            expected_result_summary="AI.D está en modo sin modelo avanzado. Usa estos números solo como referencia.",
+            risk_level="medio",
+            recommendations=[
+                "Configura OPENAI_API_KEY para activar la predicción avanzada.",
+                "Prueba distintas creatividades y audiencias para reducir el riesgo.",
+            ],
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    user_prompt = f"""
+Plataforma: {request.platform}
+Objetivo: {request.objective}
+Idioma: {lang}
+Presupuesto diario: {request.daily_budget} {request.currency}
+
+Headline:
+{request.headline}
+
+Primary text:
+{request.primary_text}
+
+Descripción adicional:
+{request.description or "Sin descripción adicional."}
+
+CTA:
+{request.cta or "Sin CTA específico."}
+
+Analiza este anuncio y devuelve SIEMPRE un JSON válido con esta estructura:
+
+{{
+  "estimated_ctr": 0.0,        // CTR estimado en porcentaje (ej. 1.8 = 1.8%)
+  "estimated_cpc": 0.0,        // CPC estimado en {request.currency}
+  "estimated_cpm": 0.0,        // CPM estimado en {request.currency}
+  "expected_result_summary": "Explica en 4–6 líneas qué se puede esperar del anuncio con este presupuesto.",
+  "risk_level": "bajo | medio | alto",
+  "recommendations": [
+    "Recomendación 1 para mejorar antes de lanzar.",
+    "Recomendación 2..."
+  ]
+}}
+
+No escribas nada fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Eres AI.D, media buyer senior. Estimas rangos de CTR, CPC y CPM basados en benchmarks, "
+                    "pero aclaras que son aproximaciones y das recomendaciones prácticas."
+                )
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=80.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return AdsPredictorResponse(
+                platform=request.platform,
+                objective=request.objective,
+                estimated_ctr=0.8,
+                estimated_cpc=1.2,
+                estimated_cpm=7.0,
+                expected_result_summary=f"No se pudo parsear el JSON. Respuesta cruda: {raw}",
+                risk_level="medio",
+                recommendations=[
+                    "Revisa manualmente la respuesta cruda del modelo.",
+                    "Ajusta el anuncio y haz un test A/B con bajo presupuesto.",
+                ],
+            )
+
+        return AdsPredictorResponse(
+            platform=request.platform,
+            objective=request.objective,
+            estimated_ctr=float(parsed.get("estimated_ctr", 0.0)),
+            estimated_cpc=float(parsed.get("estimated_cpc", 0.0)),
+            estimated_cpm=float(parsed.get("estimated_cpm", 0.0)),
+            expected_result_summary=str(parsed.get("expected_result_summary", "")),
+            risk_level=str(parsed.get("risk_level", "")),
+            recommendations=[str(r) for r in parsed.get("recommendations", [])],
+        )
+
+    except Exception as e:
+        return AdsPredictorResponse(
+            platform=request.platform,
+            objective=request.objective,
+            estimated_ctr=0.0,
+            estimated_cpc=0.0,
+            estimated_cpm=0.0,
+            expected_result_summary=f"Error al conectar con el modelo de IA: {str(e)}",
+            risk_level="alto",
+            recommendations=[
+                "Lanza el anuncio con presupuesto mínimo y monitorea datos reales.",
+                "Revisa segmentación, creatividad y oferta antes de escalar.",
+            ],
+        )
+
+
+# ============================================================
+#   E) ENDPOINT: GUIÓN DE VIDEO (REELS / TIKTOK / SHORTS)
+#   (/api/content/video-script)
+# ============================================================
+
+class VideoBeat(BaseModel):
+    second_from: int
+    second_to: int
+    action: str
+    on_screen_text: str
+
+
+class VideoScriptRequest(BaseModel):
+    platform: Literal["instagram", "tiktok", "youtube", "facebook", "generic"]
+    topic: str
+    duration_seconds: int = 30
+    objective: Literal["awareness", "engagement", "leads", "sales", "authority", "mixed"] = "awareness"
+    style: Literal["mkt360", "professional", "motivational", "direct", "friendly"] = "mkt360"
+    language: Optional[str] = None
+
+
+class VideoScriptResponse(BaseModel):
+    topic: str
+    duration_seconds: int
+    hook: str
+    script: str
+    beats: List[VideoBeat]
+    closing_cta: str
+    broll_ideas: List[str]
+
+
+@app.post("/api/content/video-script", response_model=VideoScriptResponse)
+async def video_script(request: VideoScriptRequest):
+    """
+    Genera un guion 9:16 para Reels/TikTok/Shorts en X segundos:
+    - hook
+    - guion completo
+    - beats por segundos
+    - CTA final
+    - ideas de B-roll
+    """
+
+    if request.language:
+        lang = request.language
+    else:
+        # Por defecto: TikTok/IG en español, YouTube en inglés
+        if request.platform in ["youtube"]:
+            lang = "en"
+        else:
+            lang = "es"
+
+    if not OPENAI_API_KEY:
+        return VideoScriptResponse(
+            topic=request.topic,
+            duration_seconds=request.duration_seconds,
+            hook="Configura OPENAI_API_KEY para activar el generador de guiones.",
+            script="",
+            beats=[],
+            closing_cta="Escribe SYSTEM para recibir tu diagnóstico cuando AI.D esté activo.",
+            broll_ideas=[
+                "Capturas de pantalla de métricas.",
+                "Texto grande en pantalla con tu hook."
+            ],
+        )
+
+    if request.style == "mkt360":
+        tone = (
+            "Tono MKT 360: estratégico, profesional, rápido, con foco en sistemas y resultados reales."
+        )
+    elif request.style == "professional":
+        tone = "Tono profesional, claro, directo."
+    elif request.style == "motivational":
+        tone = "Tono motivador, pero sin humo."
+    elif request.style == "direct":
+        tone = "Tono directo y contundente."
+    else:
+        tone = "Tono cercano y amigable."
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    user_prompt = f"""
+Plataforma: {request.platform}
+Tema: {request.topic}
+Duración: {request.duration_seconds} segundos
+Objetivo: {request.objective}
+Idioma: {lang}
+Tono: {tone}
+
+Estructura del video:
+- 0–3s: Hook fuerte para detener scroll.
+- Cuerpo: explicación simple, 1 idea central, ejemplos rápidos.
+- Últimos 3–5s: CTA claro con palabra clave y próxima acción.
+
+Devuelve SIEMPRE un JSON válido con esta estructura:
+
+{{
+  "hook": "Frase inicial de máximo 8 palabras para detener el scroll.",
+  "script": "Guion completo del video, con indicaciones claras para la persona que habla.",
+  "beats": [
+    {{
+      "second_from": 0,
+      "second_to": 3,
+      "action": "Qué debe ocurrir en pantalla.",
+      "on_screen_text": "Texto breve en pantalla (si aplica)."
+    }}
+  ],
+  "closing_cta": "Frase final con CTA y palabra clave.",
+  "broll_ideas": [
+    "Idea de B-roll 1",
+    "Idea de B-roll 2"
+  ]
+}}
+
+No agregues texto fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Eres AI.D, guionista experto en videos cortos 9:16 para redes sociales. "
+                    "Creas guiones accionables, concretos y alineados a objetivos de marketing."
+                )
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=80.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return VideoScriptResponse(
+                topic=request.topic,
+                duration_seconds=request.duration_seconds,
+                hook="Error al procesar JSON del modelo.",
+                script=raw,
+                beats=[],
+                closing_cta="Revisa el contenido crudo y ajusta manualmente.",
+                broll_ideas=[],
+            )
+
+        beats_list: List[VideoBeat] = []
+        for b in parsed.get("beats", []):
+            try:
+                beats_list.append(
+                    VideoBeat(
+                        second_from=int(b.get("second_from", 0)),
+                        second_to=int(b.get("second_to", 0)),
+                        action=str(b.get("action", "")),
+                        on_screen_text=str(b.get("on_screen_text", "")),
+                    )
+                )
+            except Exception:
+                continue
+
+        return VideoScriptResponse(
+            topic=request.topic,
+            duration_seconds=request.duration_seconds,
+            hook=str(parsed.get("hook", "")),
+            script=str(parsed.get("script", "")),
+            beats=beats_list,
+            closing_cta=str(parsed.get("closing_cta", "")),
+            broll_ideas=[str(i) for i in parsed.get("broll_ideas", [])],
+        )
+
+    except Exception as e:
+        return VideoScriptResponse(
+            topic=request.topic,
+            duration_seconds=request.duration_seconds,
+            hook="Error de conexión con IA.",
+            script=str(e),
+            beats=[],
+            closing_cta="Intenta generar de nuevo el guion.",
+            broll_ideas=[],
+        )
+
+
+# ============================================================
+#   CEREBRO CENTRAL DE AI.D
+#   (/api/chat/aid)
+# ============================================================
+
+class AIDChatHistoryMessage(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str
+
+
+class AIDCoreChatRequest(BaseModel):
+    message: str                               # lo que el usuario pregunta ahora
+    goal: Optional[str] = None                 # objetivo del usuario (opcional)
+    mode: Literal[
+        "generic",         # conversación general
+        "ads_planning",    # planificación de campañas
+        "content",         # ideas y mejora de contenido
+        "strategy",        # estrategia de negocio/marketing
+        "support"          # soporte / acompañamiento
+    ] = "generic"
+    language: Optional[str] = None             # idioma preferido
+    history: Optional[List[AIDChatHistoryMessage]] = None  # historial opcional
+
+
+class AIDCoreChatResponse(BaseModel):
+    reply: str
+    mode: str
+    used_language: str
+    suggestions: List[str]        # ideas concretas / recomendaciones
+    next_actions: List[str]       # próximos pasos accionables
+    fallback: bool                # True si hubo que usar modo degradado
+
+
+@app.post("/api/chat/aid", response_model=AIDCoreChatResponse)
+async def aid_core_chat(request: AIDCoreChatRequest):
+    """
+    Cerebro central de AI.D.
+
+    Este endpoint está pensado para:
+      - Conversaciones generales con AI.D
+      - Estrategia de campañas
+      - Ideas y optimización de contenido
+      - Decisiones de negocio y marketing
+      - Soporte y acompañamiento para el usuario
+
+    Siempre devuelve:
+      - una respuesta principal (reply)
+      - una lista de sugerencias
+      - una lista de próximos pasos accionables
+    """
+
+    lang = request.language or DEFAULT_LANG or "es"
+
+    # ------------------------------------------------------------------
+    # Instrucciones base de identidad de AI.D
+    # ------------------------------------------------------------------
+    base_identity = (
+        "Eres AI.D, el cerebro central de la plataforma Ad.AI y de cualquier app "
+        "donde te instalen. Tienes experiencia simulada de más de 40 años en "
+        "marketing digital, publicidad, estrategia de negocio y creación de contenido. "
+        "Tu prioridad es dar respuestas claras, accionables, cero vendehumo, "
+        "orientadas a resultados reales, especialmente para PYMEs y emprendedores."
+    )
+
+    # ------------------------------------------------------------------
+    # Ajuste según modo
+    # ------------------------------------------------------------------
+    if request.mode == "ads_planning":
+        mode_context = (
+            "Modo: ads_planning. Enfócate en campañas pagadas (Meta, Google, LinkedIn, "
+            "TikTok, etc.), distribución de presupuesto, objetivos, audiencias y creatividades."
+        )
+    elif request.mode == "content":
+        mode_context = (
+            "Modo: content. Enfócate en ideas de contenido, hooks, guiones, titulares, "
+            "formatos para redes sociales y cómo diferenciar la marca."
+        )
+    elif request.mode == "strategy":
+        mode_context = (
+            "Modo: strategy. Enfócate en estrategia general de negocio, funnels, "
+            "ofertas, posicionamiento y priorización de acciones."
+        )
+    elif request.mode == "support":
+        mode_context = (
+            "Modo: support. Enfócate en acompañar al usuario, ordenar sus ideas, "
+            "bajar la ansiedad y convertir sus dudas en un plan simple de acción."
+        )
+    else:
+        mode_context = "Modo: generic. Responde de forma equilibrada entre estrategia y acción."
+
+    # ------------------------------------------------------------------
+    # Si no hay API Key, devolvemos un fallback útil
+    # ------------------------------------------------------------------
+    if not OPENAI_API_KEY:
+        fallback_reply = (
+            "Ahora mismo AI.D está en modo básico (sin conexión al modelo avanzado). "
+            "Igual puedo ayudarte a ordenar tus ideas. Escríbeme 1) tu contexto, "
+            "2) qué quieres lograr en los próximos 30 días y 3) qué tienes disponible hoy."
+        )
+
+        return AIDCoreChatResponse(
+            reply=fallback_reply,
+            mode=request.mode,
+            used_language=lang,
+            suggestions=[
+                "Describe brevemente tu negocio o proyecto.",
+                "Cuenta qué estás haciendo hoy en marketing o contenido.",
+                "Di qué resultado te gustaría ver en 30 días."
+            ],
+            next_actions=[
+                "Escribe esos tres puntos y vuelve a enviarlos a AI.D.",
+                "Prioriza un solo objetivo principal para empezar.",
+            ],
+            fallback=True,
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    # ------------------------------------------------------------------
+    # Construimos prompt en formato JSON estricto
+    # ------------------------------------------------------------------
+    history_block = ""
+    if request.history:
+        joined = []
+        for m in request.history:
+            prefix = "Usuario" if m.role == "user" else "AI.D" if m.role == "assistant" else "Sistema"
+            joined.append(f"{prefix}: {m.content}")
+        history_block = "\n\nHistorial reciente:\n" + "\n".join(joined)
+
+    user_prompt = f"""
+Idioma de respuesta: {lang}.
+
+Identidad base:
+{base_identity}
+
+Contexto de modo:
+{mode_context}
+
+Objetivo declarado (si existe):
+{request.goal or "No especificado."}
+{history_block}
+
+Mensaje actual del usuario:
+{request.message}
+
+Devuelve SIEMPRE un JSON válido con esta estructura EXACTA:
+
+{{
+  "reply": "Respuesta principal para el usuario, en máximo 10–14 líneas, clara, directa y accionable.",
+  "suggestions": [
+    "Sugerencia concreta 1",
+    "Sugerencia concreta 2"
+  ],
+  "next_actions": [
+    "Próximo paso 1 muy específico",
+    "Próximo paso 2 muy específico",
+    "Próximo paso 3 muy específico"
+  ]
+}}
+
+No incluyas explicación ni texto fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Eres AI.D, cerebro central de Ad.AI. Eres estratégico, práctico, "
+                    "respetuoso, motivador y cero vendehumo. Siempre bajas las ideas "
+                    "a pasos concretos."
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=80.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+
+        # Intentamos parsear el JSON
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            # Si el modelo no respeta el JSON, igual devolvemos algo útil
+            return AIDCoreChatResponse(
+                reply=raw,
+                mode=request.mode,
+                used_language=lang,
+                suggestions=[],
+                next_actions=[],
+                fallback=True,
+            )
+
+        return AIDCoreChatResponse(
+            reply=str(parsed.get("reply", "")),
+            mode=request.mode,
+            used_language=lang,
+            suggestions=[str(s) for s in parsed.get("suggestions", [])],
+            next_actions=[str(a) for a in parsed.get("next_actions", [])],
+            fallback=False,
+        )
+
+    except Exception as e:
+        # Fallback si hay error en la llamada HTTP
+        return AIDCoreChatResponse(
+            reply=(
+                "Hubo un error al conectar con el modelo de IA. "
+                "Puedes intentar de nuevo en unos minutos."
+            ),
+            mode=request.mode,
+            used_language=lang,
+            suggestions=[],
+            next_actions=[f"Detalle técnico (para el equipo): {str(e)}"],
+            fallback=True,
         )
