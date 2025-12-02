@@ -571,7 +571,7 @@ Devuelve SIEMPRE un JSON válido (sin texto antes ni después) con esta estructu
     {{ "platform": "Facebook Ads", "percentage": 30 }},
     {{ "platform": "Google Ads", "percentage": 20 }}
   ],
-  "audiences": [
+    "audiences": [
     "Descripción de audiencia 1",
     "Descripción de audiencia 2"
   ],
@@ -622,7 +622,7 @@ No incluyas comentarios ni explicación fuera del JSON.
             )
 
         # Normalizamos budget_distribution
-        budget_list = []
+        budget_list: List[BudgetSplit] = []
         for item in parsed.get("budget_distribution", []):
             try:
                 budget_list.append(
@@ -799,4 +799,202 @@ No agregues texto fuera del JSON.
             keyword_gaps=[],
             performance_score=0,
             ad_recommendation="No disponible."
+        )
+
+
+# ============================================================
+#   ENDPOINT ESPECIALIZADO: GENERADOR DE CONTENIDO
+#   (/api/content/generator)
+# ============================================================
+
+class ContentGeneratorRequest(BaseModel):
+    platform: Literal["instagram", "linkedin", "tiktok", "facebook", "youtube", "generic"]
+    topic: str                           # tema del contenido
+    objective: Literal["awareness", "engagement", "leads", "sales", "authority", "mixed"]
+    style: Literal["mkt360", "professional", "motivational", "direct", "friendly"] = "mkt360"
+    keywords: Optional[List[str]] = None
+    duration: Optional[str] = None       # ej: "10s", "30s", "3 slides", "1 minuto"
+    language: Optional[str] = None       # si no viene → AI decide el idioma óptimo
+
+
+class ContentGeneratorResponse(BaseModel):
+    idea: str
+    hooks: List[str]
+    script: str
+    variants: List[str]
+    recommended_format: str
+    difficulty: str
+    ctas: List[str]
+    scroll_stopper_score: int
+    virality_probability: str
+    differentiation_level: str
+
+
+@app.post("/api/content/generator", response_model=ContentGeneratorResponse)
+async def content_generator(request: ContentGeneratorRequest):
+    """
+    Genera contenido optimizado para redes sociales:
+      - Hooks
+      - Guion
+      - Variantes A/B
+      - CTA
+      - Recomendación de formato
+      - Métricas predictivas (scroll stopper, viralidad, diferenciación)
+    """
+
+    # -------------------------------------------------------
+    # Selección automática de idioma según plataforma
+    # -------------------------------------------------------
+    if request.language:
+        lang = request.language
+    else:
+        if request.platform in ["linkedin"]:
+            lang = "en"
+        elif request.platform in ["instagram", "facebook", "tiktok"]:
+            lang = "es"
+        else:
+            lang = DEFAULT_LANG or "es"
+
+    # -------------------------------------------------------
+    # Estilo MKT 360
+    # -------------------------------------------------------
+    if request.style == "mkt360":
+        tone = (
+            "Usa tono MKT 360: inteligente, rápido, elegante, profesional, orientado al futuro, "
+            "cero vendehumo, directo al punto, motivador y estratégico."
+        )
+    elif request.style == "professional":
+        tone = "Tono profesional, claro, ejecutivo y directo."
+    elif request.style == "motivational":
+        tone = "Tono motivador, inspirador, enfocado en crecimiento y mentalidad."
+    elif request.style == "direct":
+        tone = "Tono directo, claro y sin rodeos."
+    else:
+        tone = "Tono cercano y amigable."
+
+    # -------------------------------------------------------
+    # Validación de API Key
+    # -------------------------------------------------------
+    if not OPENAI_API_KEY:
+        return ContentGeneratorResponse(
+            idea="AI.D no tiene clave configurada.",
+            hooks=[],
+            script="",
+            variants=[],
+            recommended_format="",
+            difficulty="",
+            ctas=[],
+            scroll_stopper_score=0,
+            virality_probability="Desconocida",
+            differentiation_level="Desconocido"
+        )
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    keywords_str = ", ".join(request.keywords) if request.keywords else "Ninguna"
+
+    # -------------------------------------------------------
+    # Prompt con estructura JSON estricta
+    # -------------------------------------------------------
+    user_prompt = f"""
+Genera contenido para la plataforma: {request.platform}
+Objetivo del contenido: {request.objective}
+Idioma: {lang}
+Duración/estructura: {request.duration or "No especificada"}
+Palabras clave obligatorias: {keywords_str}
+
+Tema central: {request.topic}
+
+Estilo requerido:
+{tone}
+
+Devuelve SIEMPRE un JSON válido con esta estructura exacta:
+
+{{
+  "idea": "Idea general del contenido.",
+  "hooks": ["Hook 1", "Hook 2", "Hook 3"],
+  "script": "Guion completo optimizado con palabras clave.",
+  "variants": ["Variante A", "Variante B"],
+  "recommended_format": "Reel 30s / Carrusel 3 slides / Post estático",
+  "difficulty": "baja | media | alta",
+  "ctas": ["CTA 1", "CTA 2"],
+  "scroll_stopper_score": 0-100,
+  "virality_probability": "baja | media | alta | muy alta",
+  "differentiation_level": "bajo | medio | alto | único"
+}}
+
+No escribas nada fuera del JSON.
+"""
+
+    payload = {
+        "model": "gpt-4.1-mini",
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Eres AI.D, generador creativo avanzado para publicidad y contenido. "
+                    "Experto en comportamiento humano, scroll-stoppers, marketing digital, "
+                    "copywriting de alto rendimiento y visual strategy."
+                )
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=80.0) as client_http:
+            r = await client_http.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"]
+
+        # Procesar JSON
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return ContentGeneratorResponse(
+                idea="No se pudo procesar el JSON.",
+                hooks=[],
+                script=raw,
+                variants=[],
+                recommended_format="",
+                difficulty="",
+                ctas=[],
+                scroll_stopper_score=0,
+                virality_probability="desconocida",
+                differentiation_level="desconocido"
+            )
+
+        return ContentGeneratorResponse(
+            idea=str(parsed.get("idea", "")),
+            hooks=[str(h) for h in parsed.get("hooks", [])],
+            script=str(parsed.get("script", "")),
+            variants=[str(v) for v in parsed.get("variants", [])],
+            recommended_format=str(parsed.get("recommended_format", "")),
+            difficulty=str(parsed.get("difficulty", "")),
+            ctas=[str(c) for c in parsed.get("ctas", [])],
+            scroll_stopper_score=int(parsed.get("scroll_stopper_score", 0)),
+            virality_probability=str(parsed.get("virality_probability", "")),
+            differentiation_level=str(parsed.get("differentiation_level", "")),
+        )
+
+    except Exception as e:
+        return ContentGeneratorResponse(
+            idea="Error en servidor o conexión con OpenAI.",
+            hooks=[],
+            script=str(e),
+            variants=[],
+            recommended_format="",
+            difficulty="",
+            ctas=[],
+            scroll_stopper_score=0,
+            virality_probability="Desconocida",
+            differentiation_level="Desconocido"
         )
