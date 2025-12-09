@@ -27,7 +27,7 @@ app = FastAPI(
 # CORS: para que luego puedas llamarlo desde otras apps/frontends
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # luego lo puedes restringir a tus dominios
+    allow_origins=["*"],  # luego lo puedes restringir a tus domininios
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,6 +35,14 @@ app.add_middleware(
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_LANG = os.getenv("AID_DEFAULT_LANG", "es")
+
+# ============================================================
+#   CONFIGURACIÓN PROVEEDOR LLM (OPENAI / LOCAL)
+# ============================================================
+
+LLM_PROVIDER = os.getenv("AID_LLM_PROVIDER", "openai").lower()  # "openai" o "local"
+LOCAL_LLM_URL = os.getenv("AID_LOCAL_LLM_URL", "http://localhost:11434/api/chat")
+LOCAL_LLM_MODEL = os.getenv("AID_LOCAL_LLM_MODEL", "phi-2")
 
 # ============================================================
 #   LISTA DE PALABRAS FUERTES PARA STOP SCROLL (HEURÍSTICA)
@@ -73,8 +81,10 @@ STRONG_WORDS = [
     "auditoria",
 ]
 
+
 def _word_count(text: str) -> int:
     return len([w for w in text.strip().split() if w])
+
 
 def _count_strong_words(text: str) -> int:
     lower = text.lower()
@@ -83,6 +93,7 @@ def _count_strong_words(text: str) -> int:
         if w in lower:
             count += 1
     return count
+
 
 def _evaluate_scroll_stop(topic: str, platform: str) -> Tuple[int, List[str]]:
     """
@@ -195,12 +206,14 @@ def _evaluate_scroll_stop(topic: str, platform: str) -> Tuple[int, List[str]]:
 
     return score, details
 
+
 def _scroll_level(score: int) -> str:
     if score >= 80:
         return "ALTO"
     if score >= 55:
         return "MEDIO"
     return "BAJO"
+
 
 def _scroll_advice(score: int, platform: str) -> str:
     if platform == "linkedin":
@@ -227,6 +240,84 @@ def _scroll_advice(score: int, platform: str) -> str:
     )
 
 # ============================================================
+#   CAPA GENÉRICA DE LLM (OPENAI / LOCAL)
+# ============================================================
+
+
+async def _call_openai_chat(messages: List[dict], model: str = "gpt-4.1-mini") -> Optional[str]:
+    """
+    Llamada genérica a OpenAI Chat Completions.
+    Devuelve el 'content' del primer mensaje o None si falla.
+    """
+    if not OPENAI_API_KEY:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": model,
+        "messages": messages,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=80.0) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+async def _call_local_chat(messages: List[dict], model: Optional[str] = None) -> Optional[str]:
+    """
+    Llamada genérica a un modelo local (ej. Ollama /phi-2).
+    Ajusta el body si tu servidor usa un formato distinto.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=80.0) as client:
+            r = await client.post(
+                LOCAL_LLM_URL,
+                json={
+                    "model": model or LOCAL_LLM_MODEL,
+                    "messages": messages,
+                },
+            )
+        r.raise_for_status()
+        data = r.json()
+
+        # Intentamos distintas estructuras comunes
+        if isinstance(data, dict):
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+            if "message" in data and isinstance(data["message"], dict) and "content" in data["message"]:
+                return data["message"]["content"]
+            if "content" in data:
+                return data["content"]
+
+        return None
+    except Exception:
+        return None
+
+
+async def call_llm_messages(messages: List[dict], model: str = "gpt-4.1-mini") -> Optional[str]:
+    """
+    Capa unificada: decide según LLM_PROVIDER si usa OpenAI o local.
+    """
+    if LLM_PROVIDER == "local":
+        return await _call_local_chat(messages, model=model)
+    # por defecto: openai
+    return await _call_openai_chat(messages, model=model)
+
+
+# ============================================================
 #   MODELOS DE PETICIÓN / RESPUESTA (ENDPOINT /chat)
 # ============================================================
 
@@ -249,13 +340,21 @@ class ChatResponse(BaseModel):
 
 @app.get("/")
 def root():
+    if LLM_PROVIDER == "openai":
+        llm_configured = bool(OPENAI_API_KEY)
+    else:
+        # Asumimos que el modelo local está corriendo si el proveedor es "local"
+        llm_configured = True
+
     return {
         "status": "ok",
         "name": "AI.D Core API",
         "version": "1.0.0",
         "modes": ["adai", "external"],
         "default_lang": DEFAULT_LANG,
-        "llm_configured": bool(OPENAI_API_KEY),
+        "llm_configured": llm_configured,
+        "llm_provider": LLM_PROVIDER,
+        "local_llm_url": LOCAL_LLM_URL if LLM_PROVIDER == "local" else None,
     }
 
 
@@ -265,44 +364,19 @@ def root():
 
 async def call_llm(prompt: str, language: str) -> Optional[str]:
     """
-    Llama al modelo de OpenAI usando la API HTTP.
+    Llama al modelo configurado (OpenAI o local) a través de la capa genérica.
     Devuelve el texto generado, o None si algo falla (para usar fallback).
     """
-    if not OPENAI_API_KEY:
-        return None
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
+    system_msg = {
+        "role": "system",
+        "content": (
+            "Eres AI.D, la IA que se adapta al contexto donde se instala. "
+            "Responde de forma clara, estratégica y accionable."
+        ),
     }
+    user_msg = {"role": "user", "content": prompt}
 
-    payload = {
-        "model": "gpt-4.1-mini",  # puedes cambiarlo luego
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Eres AI.D, la IA que se adapta al contexto donde se instala. "
-                    "Responde de forma clara, estratégica y accionable."
-                ),
-            },
-            {"role": "user", "content": prompt},
-        ],
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=40.0) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
-    except Exception:
-        # Si falla la llamada, devolvemos None y el endpoint usará fallback
-        return None
+    return await call_llm_messages([system_msg, user_msg], model="gpt-4.1-mini")
 
 
 # ============================================================
@@ -619,8 +693,8 @@ async def aid_chat(request: WidgetChatRequest):
       - messages: historial de conversación (user/assistant)
     """
 
-    if not OPENAI_API_KEY:
-        # Fallback rápido si no hay API key configurada
+    # Si el proveedor es OpenAI y no hay clave, fallback
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         return WidgetChatResponse(
             reply=(
                 "Ahora mismo AI.D no tiene configurada la clave de OpenAI. "
@@ -628,39 +702,22 @@ async def aid_chat(request: WidgetChatRequest):
             )
         )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # Construimos la lista de mensajes para OpenAI
-    openai_messages = [{"role": "system", "content": request.system_prompt}]
+    # Construimos la lista de mensajes para la capa genérica
+    llm_messages = [{"role": "system", "content": request.system_prompt}]
     for m in request.messages:
-        openai_messages.append({"role": m.role, "content": m.content})
+        llm_messages.append({"role": m.role, "content": m.content})
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": openai_messages,
-    }
+    reply = await call_llm_messages(llm_messages, model="gpt-4.1-mini")
 
-    try:
-        async with httpx.AsyncClient(timeout=40.0) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        data = r.json()
-        reply = data["choices"][0]["message"]["content"].strip()
-        return WidgetChatResponse(reply=reply)
-    except Exception:
+    if reply is None:
         return WidgetChatResponse(
             reply=(
                 "No pude conectar con el modelo de IA en este momento. "
                 "Si necesitas ayuda urgente, te recomiendo contactar directamente con MKT 360."
             )
         )
+
+    return WidgetChatResponse(reply=reply.strip())
 
 
 # ============================================================
@@ -709,8 +766,8 @@ async def ads_optimizer(request: AdsOptimizerRequest):
 
     lang = request.language or DEFAULT_LANG or "es"
 
-    if not OPENAI_API_KEY:
-        # Fallback rápido si no hay API key configurada
+    # Fallback cuando proveedor es OpenAI y no hay clave
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         return AdsOptimizerResponse(
             summary=(
                 "AI.D no tiene configurada la clave de OpenAI en el servidor. "
@@ -723,14 +780,8 @@ async def ads_optimizer(request: AdsOptimizerRequest):
             ctas=[],
         )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
     business_name = request.business_name or "Sin nombre específico"
     notes = request.notes or "Sin notas adicionales."
-
     platforms_str = ", ".join(request.platforms)
 
     system_prompt = (
@@ -761,7 +812,7 @@ Devuelve SIEMPRE un JSON válido (sin texto antes ni después) con esta estructu
     {{ "platform": "Facebook Ads", "percentage": 30 }},
     {{ "platform": "Google Ads", "percentage": 20 }}
   ],
-    "audiences": [
+  "audiences": [
     "Descripción de audiencia 1",
     "Descripción de audiencia 2"
   ],
@@ -779,24 +830,16 @@ Asegúrate de que la suma de los porcentajes de budget_distribution sea aproxima
 No incluyas comentarios ni explicación fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        data = r.json()
-        raw_content = data["choices"][0]["message"]["content"]
+        raw_content = await call_llm_messages(messages, model="gpt-4.1-mini")
+
+        if raw_content is None:
+            raise RuntimeError("LLM sin respuesta")
 
         try:
             parsed = json.loads(raw_content)
@@ -811,7 +854,6 @@ No incluyas comentarios ni explicación fuera del JSON.
                 ctas=[],
             )
 
-        # Normalizamos budget_distribution
         budget_list: List[BudgetSplit] = []
         for item in parsed.get("budget_distribution", []):
             try:
@@ -838,7 +880,7 @@ No incluyas comentarios ni explicación fuera del JSON.
         return AdsOptimizerResponse(
             summary=(
                 "No se pudo conectar con el modelo de IA para generar la estrategia. "
-                "Intenta de nuevo en unos minutos o revisa la configuración de la API."
+                "Intenta de nuevo en unos minutos o revisa la configuración del modelo."
             ),
             recommended_strategy="",
             budget_distribution=[],
@@ -887,7 +929,7 @@ async def content_analyzer(request: ContentAnalyzerRequest):
 
     lang = request.language or DEFAULT_LANG or "es"
 
-    if not OPENAI_API_KEY:
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         return ContentAnalyzerResponse(
             summary="AI.D no tiene clave de OpenAI configurada.",
             strengths=[],
@@ -899,10 +941,7 @@ async def content_analyzer(request: ContentAnalyzerRequest):
             ad_recommendation="No disponible."
         )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    keywords_str = ", ".join(request.keywords) if request.keywords else "Ninguna"
 
     user_prompt = f"""
 Analiza el siguiente contenido para la plataforma: {request.platform}.
@@ -913,7 +952,7 @@ Contenido del usuario:
 
 URL asociada (si aplica): {request.url or "No proporcionada"}
 
-Palabras clave esperadas: {", ".join(request.keywords) if request.keywords else "Ninguna"}
+Palabras clave esperadas: {keywords_str}
 
 Devuelve SIEMPRE un JSON válido con esta estructura:
 
@@ -931,28 +970,20 @@ Devuelve SIEMPRE un JSON válido con esta estructura:
 No agregues texto fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": "Eres AI.D, analista senior de contenido para marketing digital y publicidad."
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": "Eres AI.D, analista senior de contenido para marketing digital y publicidad."
+        },
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
 
-        # Intentamos parsear el JSON estrictamente
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
+
         try:
             parsed = json.loads(raw)
         except Exception:
@@ -989,6 +1020,248 @@ No agregues texto fuera del JSON.
             keyword_gaps=[],
             performance_score=0,
             ad_recommendation="No disponible."
+        )
+
+
+# ============================================================
+#   NUEVO ENDPOINT: AUDITOR SEO 360° (/api/seo/audit)
+# ============================================================
+
+class VisibleSEO(BaseModel):
+    title: Optional[str] = None
+    h1: Optional[str] = None
+    other_headings: List[str] = []
+    content_focus: str = ""
+    readability: str = ""
+    keyword_usage: str = ""
+
+
+class HiddenSEO(BaseModel):
+    meta_title_ok: bool = False
+    meta_description_ok: bool = False
+    meta_robots: Optional[str] = None
+    canonical_present: bool = False
+    schema_org_present: bool = False
+    open_graph_present: bool = False
+    hreflang_present: bool = False
+    notes: str = ""
+
+
+class SeoAuditRequest(BaseModel):
+    url: Optional[str] = None
+    html: Optional[str] = None
+    text: Optional[str] = None
+    target_keywords: Optional[List[str]] = None
+    language: Optional[str] = None
+
+
+class SeoAuditResponse(BaseModel):
+    url: Optional[str] = None
+    summary: str
+    visible_seo: VisibleSEO
+    hidden_seo: HiddenSEO
+    priority_fixes: List[str]
+    quick_wins: List[str]
+    recommended_keywords: List[str]
+    checklist_90_days: List[str]
+
+
+@app.post("/api/seo/audit", response_model=SeoAuditResponse)
+async def seo_audit(request: SeoAuditRequest):
+    """
+    Auditoría SEO 360° para sitios web:
+      - Analiza lo que ve el usuario (títulos, contenido, enfoque, legibilidad).
+      - Analiza lo que ve el buscador (meta, canonical, OG, schema, etc.).
+    Pensado para ser consumido por:
+      - Ad.AI
+      - Widgets / scripts instalables en cualquier sitio.
+    """
+
+    lang = request.language or DEFAULT_LANG or "es"
+
+    # Necesitamos al menos algo de contenido (texto o HTML)
+    if not (request.text or request.html):
+        # Fallback rápido sin IA
+        return SeoAuditResponse(
+            url=request.url,
+            summary=(
+                "No se pudo realizar la auditoría SEO porque no se envió contenido "
+                "('text' o 'html')."
+            ),
+            visible_seo=VisibleSEO(),
+            hidden_seo=HiddenSEO(notes="Sin contenido para analizar."),
+            priority_fixes=[
+                "Vuelve a llamar el endpoint enviando al menos el HTML o texto plano de la página."
+            ],
+            quick_wins=[],
+            recommended_keywords=[],
+            checklist_90_days=[],
+        )
+
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
+        # Fallback cuando no hay modelo avanzado
+        return SeoAuditResponse(
+            url=request.url,
+            summary=(
+                "AI.D está en modo básico (sin clave de OpenAI configurada). "
+                "Se requiere OPENAI_API_KEY para activar la auditoría SEO avanzada."
+            ),
+            visible_seo=VisibleSEO(),
+            hidden_seo=HiddenSEO(notes="Sin análisis técnico por falta de modelo."),
+            priority_fixes=[
+                "Configurar la variable de entorno OPENAI_API_KEY en el servidor.",
+                "Reintentar la auditoría SEO una vez activado el modelo.",
+            ],
+            quick_wins=[],
+            recommended_keywords=[],
+            checklist_90_days=[],
+        )
+
+    base_content = request.text or request.html or ""
+    base_content = base_content[:15000]  # recorte por seguridad
+
+    target_keywords_str = (
+        ", ".join(request.target_keywords) if request.target_keywords else "Ninguna keyword objetivo específica."
+    )
+
+    idioma = "español" if lang.startswith("es") else "inglés"
+
+    user_prompt = f"""
+Eres AI.D, una IA experta en SEO on-page y técnico.
+
+Tu tarea es analizar una página web tanto en lo que el usuario ve (contenido, títulos, textos)
+como en lo que el buscador ve (meta tags, schema, OG, robots, canonicals, etc.).
+
+Responde SIEMPRE en {idioma} y SIEMPRE en formato JSON con esta estructura EXACTA:
+
+{{
+  "summary": "Resumen breve de 2–3 frases sobre el estado SEO de la página.",
+  "visible_seo": {{
+    "title": "Título principal que percibe el usuario (puede basarse en <title> o H1).",
+    "h1": "Contenido del H1 principal si es identificable.",
+    "other_headings": ["Lista de otros headings relevantes (H2, H3)."],
+    "content_focus": "Evaluación del enfoque del contenido respecto a las keywords.",
+    "readability": "Comentarios sobre claridad, extensión y estructura del contenido.",
+    "keyword_usage": "Cómo se usan las palabras clave objetivo en el contenido."
+  }},
+  "hidden_seo": {{
+    "meta_title_ok": true,
+    "meta_description_ok": false,
+    "meta_robots": "Valor de meta robots si se puede inferir, o 'desconocido'.",
+    "canonical_present": true,
+    "schema_org_present": false,
+    "open_graph_present": true,
+    "hreflang_present": false,
+    "notes": "Notas resumidas sobre meta tags, OG, schema, indexabilidad, etc."
+  }},
+  "priority_fixes": [
+    "Lista de 3–7 acciones SEO críticas y priorizadas (alto impacto)."
+  ],
+  "quick_wins": [
+    "Lista de 3–7 mejoras rápidas que se puedan aplicar en 1–2 días."
+  ],
+  "recommended_keywords": [
+    "Lista de 5–10 palabras clave sugeridas, relacionadas con el contenido y las keywords objetivo."
+  ],
+  "checklist_90_days": [
+    "Lista de 5–10 acciones a completar en 90 días para mejorar SEO on-page y técnico."
+  ]
+}}
+
+Ten en cuenta:
+- Contenido proporcionado (HTML o texto plano recortado):
+\"\"\"{base_content}\"\"\"
+
+- Palabras clave objetivo del cliente:
+{target_keywords_str}
+
+Reglas:
+- Si no puedes detectar algo con claridad (por ejemplo, schema.org o hreflang),
+  responde de forma conservadora (por ejemplo, schema_org_present: false y anótalo en 'notes').
+- En 'priority_fixes' y 'quick_wins', da acciones concretas, no genéricas.
+- En 'recommended_keywords', mezcla variaciones de cola corta y cola larga.
+- No agregues texto fuera del JSON. Solo responde el objeto JSON.
+"""
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres AI.D, una IA experta en SEO on-page y técnico. "
+                "Analizas tanto el contenido visible como las señales técnicas."
+            ),
+        },
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
+
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
+
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return SeoAuditResponse(
+                url=request.url,
+                summary="No se pudo parsear la respuesta del modelo como JSON.",
+                visible_seo=VisibleSEO(),
+                hidden_seo=HiddenSEO(notes="Revisa la respuesta cruda del modelo y ajusta el prompt si es necesario."),
+                priority_fixes=[],
+                quick_wins=[],
+                recommended_keywords=[],
+                checklist_90_days=[],
+            )
+
+        visible_data = parsed.get("visible_seo", {}) or {}
+        hidden_data = parsed.get("hidden_seo", {}) or {}
+
+        visible = VisibleSEO(
+            title=visible_data.get("title"),
+            h1=visible_data.get("h1"),
+            other_headings=visible_data.get("other_headings", []) or [],
+            content_focus=visible_data.get("content_focus", "") or "",
+            readability=visible_data.get("readability", "") or "",
+            keyword_usage=visible_data.get("keyword_usage", "") or "",
+        )
+
+        hidden = HiddenSEO(
+            meta_title_ok=bool(hidden_data.get("meta_title_ok", False)),
+            meta_description_ok=bool(hidden_data.get("meta_description_ok", False)),
+            meta_robots=hidden_data.get("meta_robots"),
+            canonical_present=bool(hidden_data.get("canonical_present", False)),
+            schema_org_present=bool(hidden_data.get("schema_org_present", False)),
+            open_graph_present=bool(hidden_data.get("open_graph_present", False)),
+            hreflang_present=bool(hidden_data.get("hreflang_present", False)),
+            notes=hidden_data.get("notes", "") or "",
+        )
+
+        return SeoAuditResponse(
+            url=request.url,
+            summary=str(parsed.get("summary", "")),
+            visible_seo=visible,
+            hidden_seo=hidden,
+            priority_fixes=[str(a) for a in parsed.get("priority_fixes", [])],
+            quick_wins=[str(a) for a in parsed.get("quick_wins", [])],
+            recommended_keywords=[str(k) for k in parsed.get("recommended_keywords", [])],
+            checklist_90_days=[str(t) for t in parsed.get("checklist_90_days", [])],
+        )
+
+    except Exception as e:
+        # Error al conectar con LLM
+        return SeoAuditResponse(
+            url=request.url,
+            summary="Hubo un error al conectar con el modelo de IA para la auditoría SEO.",
+            visible_seo=VisibleSEO(),
+            hidden_seo=HiddenSEO(notes=f"Detalle técnico: {str(e)}"),
+            priority_fixes=[
+                "Reintentar la auditoría en unos minutos.",
+                "Verificar la conectividad del servidor con el modelo configurado.",
+            ],
+            quick_wins=[],
+            recommended_keywords=[],
+            checklist_90_days=[],
         )
 
 
@@ -1032,9 +1305,7 @@ async def content_generator(request: ContentGeneratorRequest):
       - Métricas predictivas (scroll stopper, viralidad, diferenciación)
     """
 
-    # -------------------------------------------------------
     # Selección automática de idioma según plataforma
-    # -------------------------------------------------------
     if request.language:
         lang = request.language
     else:
@@ -1045,9 +1316,6 @@ async def content_generator(request: ContentGeneratorRequest):
         else:
             lang = DEFAULT_LANG or "es"
 
-    # -------------------------------------------------------
-    # Estilo MKT 360
-    # -------------------------------------------------------
     if request.style == "mkt360":
         tone = (
             "Usa tono MKT 360: inteligente, rápido, elegante, profesional, orientado al futuro, "
@@ -1062,10 +1330,7 @@ async def content_generator(request: ContentGeneratorRequest):
     else:
         tone = "Tono cercano y amigable."
 
-    # -------------------------------------------------------
-    # Validación de API Key
-    # -------------------------------------------------------
-    if not OPENAI_API_KEY:
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         return ContentGeneratorResponse(
             idea="AI.D no tiene clave configurada.",
             hooks=[],
@@ -1079,16 +1344,8 @@ async def content_generator(request: ContentGeneratorRequest):
             differentiation_level="Desconocido"
         )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
     keywords_str = ", ".join(request.keywords) if request.keywords else "Ninguna"
 
-    # -------------------------------------------------------
-    # Prompt con estructura JSON estricta
-    # -------------------------------------------------------
     user_prompt = f"""
 Genera contenido para la plataforma: {request.platform}
 Objetivo del contenido: {request.objective}
@@ -1119,33 +1376,24 @@ Devuelve SIEMPRE un JSON válido con esta estructura exacta:
 No escribas nada fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Eres AI.D, generador creativo avanzado para publicidad y contenido. "
-                    "Experto en comportamiento humano, scroll-stoppers, marketing digital, "
-                    "copywriting de alto rendimiento y visual strategy."
-                )
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres AI.D, generador creativo avanzado para publicidad y contenido. "
+                "Experto en comportamiento humano, scroll-stoppers, marketing digital, "
+                "copywriting de alto rendimiento y visual strategy."
+            )
+        },
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=80.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
 
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
 
-        # Procesar JSON
         try:
             parsed = json.loads(raw)
         except Exception:
@@ -1177,7 +1425,7 @@ No escribas nada fuera del JSON.
 
     except Exception as e:
         return ContentGeneratorResponse(
-            idea="Error en servidor o conexión con OpenAI.",
+            idea="Error en servidor o conexión con el modelo.",
             hooks=[],
             script=str(e),
             variants=[],
@@ -1231,7 +1479,6 @@ async def scroll_stop(request: ScrollStopRequest):
     level = _scroll_level(score)
     advice = _scroll_advice(score, platform)
 
-    # (Por ahora solo damos respuesta en español, aunque uses 'en' como lang)
     return ScrollStopResponse(
         score=int(score),
         level=level,
@@ -1280,8 +1527,8 @@ async def hook_optimizer(request: HookOptimizerRequest):
     orig_score, _ = _evaluate_scroll_stop(original_hook, platform)
     orig_level = _scroll_level(orig_score)
 
-    # Si no hay OPENAI_API_KEY, devolvemos versión básica sin IA
-    if not OPENAI_API_KEY:
+    # Si el proveedor es OpenAI y no hay API key, devolvemos versión básica sin IA
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         return HookOptimizerResponse(
             original_hook=original_hook,
             original_score=int(orig_score),
@@ -1294,11 +1541,6 @@ async def hook_optimizer(request: HookOptimizerRequest):
             recommended_format="Post estático",
             suggested_keyword="SYSTEM",
         )
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
     user_prompt = f"""
 Plataforma: {platform}
@@ -1325,35 +1567,27 @@ Genera SIEMPRE un JSON válido con esta estructura:
 No escribas nada fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Eres AI.D, experto en hooks de alto rendimiento para redes sociales. "
-                    "Conoces a fondo el comportamiento de scroll en Instagram, LinkedIn, TikTok, Threads y YouTube. "
-                    "Tu misión es hacer los hooks más cortos, claros y potentes, alineados al funnel."
-                )
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres AI.D, experto en hooks de alto rendimiento para redes sociales. "
+                "Conoces a fondo el comportamiento de scroll en Instagram, LinkedIn, TikTok, Threads y YouTube. "
+                "Tu misión es hacer los hooks más cortos, claros y potentes, alineados al funnel."
+            )
+        },
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
+
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
 
         try:
             parsed = json.loads(raw)
         except Exception:
-            # Si falla el parseo, usamos el texto libre como explicación
             return HookOptimizerResponse(
                 original_hook=original_hook,
                 original_score=int(orig_score),
@@ -1445,12 +1679,12 @@ async def slide_generator(request: SlideGeneratorRequest):
         # Por defecto: IG en español, LinkedIn en inglés
         lang = "es" if request.platform == "instagram" else "en"
 
-    if not OPENAI_API_KEY:
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         # Fallback simple
         fake_slide = SlideBlock(
             index=1,
             title="AI.D sin modelo configurado",
-            body="Configura la variable OPENAI_API_KEY en el servidor para activar el generador de slides.",
+            body="Configura la variable OPENAI_API_KEY o un modelo local para activar el generador de slides.",
             cta="Escribe SYSTEM para activar tu funnel."
         )
         return SlideGeneratorResponse(
@@ -1474,11 +1708,6 @@ async def slide_generator(request: SlideGeneratorRequest):
         tone = "Tono directo, sin rodeos."
     else:
         tone = "Tono cercano y amigable."
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
     user_prompt = f"""
 Plataforma: {request.platform}
@@ -1513,29 +1742,22 @@ Devuelve SIEMPRE un JSON válido con esta estructura:
 No agregues texto fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Eres AI.D, experto en creación de carruseles estratégicos siguiendo el Plan Clientes Nuevos. "
-                    "Estructuras slides claras, accionables y con CTA en línea con el funnel."
-                )
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres AI.D, experto en creación de carruseles estratégicos siguiendo el Plan Clientes Nuevos. "
+                "Estructuras slides claras, accionables y con CTA en línea con el funnel."
+            )
+        },
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=80.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
+
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
 
         try:
             parsed = json.loads(raw)
@@ -1647,7 +1869,7 @@ async def funnel_map(request: FunnelMapRequest):
 
     lang = request.language or DEFAULT_LANG or "es"
 
-    if not OPENAI_API_KEY:
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         return FunnelMapResponse(
             topic=request.topic,
             platform=request.platform,
@@ -1675,11 +1897,6 @@ async def funnel_map(request: FunnelMapRequest):
                 "Diagnósticos completados"
             ],
         )
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
     user_prompt = f"""
 Tema central del contenido: {request.topic}
@@ -1737,34 +1954,26 @@ Devuelve SIEMPRE un JSON válido con esta estructura:
 No incluyas texto fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Eres AI.D, arquitecto de funnels para PYMEs y emprendedores. "
-                    "Conviertes un solo contenido en un mini sistema comercial: atraer, activar, diagnosticar y cerrar."
-                )
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres AI.D, arquitecto de funnels para PYMEs y emprendedores. "
+                "Conviertes un solo contenido en un mini sistema comercial: atraer, activar, diagnosticar y cerrar."
+            )
+        },
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=80.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
+
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
 
         try:
             parsed = json.loads(raw)
         except Exception:
-            # Fallback si el JSON viene mal
             return FunnelMapResponse(
                 topic=request.topic,
                 platform=request.platform,
@@ -1875,7 +2084,7 @@ async def ads_predictor(request: AdsPredictorRequest):
 
     lang = request.language or DEFAULT_LANG or "es"
 
-    if not OPENAI_API_KEY:
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         # Valores ficticios conservadores
         return AdsPredictorResponse(
             platform=request.platform,
@@ -1886,15 +2095,10 @@ async def ads_predictor(request: AdsPredictorRequest):
             expected_result_summary="AI.D está en modo sin modelo avanzado. Usa estos números solo como referencia.",
             risk_level="medio",
             recommendations=[
-                "Configura OPENAI_API_KEY para activar la predicción avanzada.",
+                "Configura OPENAI_API_KEY o un modelo local para activar la predicción avanzada.",
                 "Prueba distintas creatividades y audiencias para reducir el riesgo.",
             ],
         )
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
     user_prompt = f"""
 Plataforma: {request.platform}
@@ -1917,9 +2121,9 @@ CTA:
 Analiza este anuncio y devuelve SIEMPRE un JSON válido con esta estructura:
 
 {{
-  "estimated_ctr": 0.0,        // CTR estimado en porcentaje (ej. 1.8 = 1.8%)
-  "estimated_cpc": 0.0,        // CPC estimado en {request.currency}
-  "estimated_cpm": 0.0,        // CPM estimado en {request.currency}
+  "estimated_ctr": 0.0,
+  "estimated_cpc": 0.0,
+  "estimated_cpm": 0.0,
   "expected_result_summary": "Explica en 4–6 líneas qué se puede esperar del anuncio con este presupuesto.",
   "risk_level": "bajo | medio | alto",
   "recommendations": [
@@ -1931,29 +2135,22 @@ Analiza este anuncio y devuelve SIEMPRE un JSON válido con esta estructura:
 No escribas nada fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Eres AI.D, media buyer senior. Estimas rangos de CTR, CPC y CPM basados en benchmarks, "
-                    "pero aclaras que son aproximaciones y das recomendaciones prácticas."
-                )
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres AI.D, media buyer senior. Estimas rangos de CTR, CPC y CPM basados en benchmarks, "
+                "pero aclaras que son aproximaciones y das recomendaciones prácticas."
+            )
+        },
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=80.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
+
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
 
         try:
             parsed = json.loads(raw)
@@ -2050,11 +2247,11 @@ async def video_script(request: VideoScriptRequest):
         else:
             lang = "es"
 
-    if not OPENAI_API_KEY:
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         return VideoScriptResponse(
             topic=request.topic,
             duration_seconds=request.duration_seconds,
-            hook="Configura OPENAI_API_KEY para activar el generador de guiones.",
+            hook="Configura OPENAI_API_KEY o un modelo local para activar el generador de guiones.",
             script="",
             beats=[],
             closing_cta="Escribe SYSTEM para recibir tu diagnóstico cuando AI.D esté activo.",
@@ -2076,11 +2273,6 @@ async def video_script(request: VideoScriptRequest):
         tone = "Tono directo y contundente."
     else:
         tone = "Tono cercano y amigable."
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
 
     user_prompt = f"""
 Plataforma: {request.platform}
@@ -2118,29 +2310,22 @@ Devuelve SIEMPRE un JSON válido con esta estructura:
 No agregues texto fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Eres AI.D, guionista experto en videos cortos 9:16 para redes sociales. "
-                    "Creas guiones accionables, concretos y alineados a objetivos de marketing."
-                )
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres AI.D, guionista experto en videos cortos 9:16 para redes sociales. "
+                "Creas guiones accionables, concretos y alineados a objetivos de marketing."
+            )
+        },
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=80.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
+
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
 
         try:
             parsed = json.loads(raw)
@@ -2244,20 +2429,14 @@ async def aid_core_chat(request: AIDCoreChatRequest):
 
     lang = request.language or DEFAULT_LANG or "es"
 
-    # ------------------------------------------------------------------
-    # Instrucciones base de identidad de AI.D
-    # ------------------------------------------------------------------
     base_identity = (
         "Eres AI.D, el cerebro central de la plataforma Ad.AI y de cualquier app "
-        "donde te instalen. Tienes experiencia simulada de más de 40 años en "
+        "donde se te instale. Tienes experiencia simulada de más de 40 años en "
         "marketing digital, publicidad, estrategia de negocio y creación de contenido. "
         "Tu prioridad es dar respuestas claras, accionables, cero vendehumo, "
         "orientadas a resultados reales, especialmente para PYMEs y emprendedores."
     )
 
-    # ------------------------------------------------------------------
-    # Ajuste según modo
-    # ------------------------------------------------------------------
     if request.mode == "ads_planning":
         mode_context = (
             "Modo: ads_planning. Enfócate en campañas pagadas (Meta, Google, LinkedIn, "
@@ -2281,10 +2460,8 @@ async def aid_core_chat(request: AIDCoreChatRequest):
     else:
         mode_context = "Modo: generic. Responde de forma equilibrada entre estrategia y acción."
 
-    # ------------------------------------------------------------------
-    # Si no hay API Key, devolvemos un fallback útil
-    # ------------------------------------------------------------------
-    if not OPENAI_API_KEY:
+    # Si proveedor es OpenAI y no hay clave → fallback
+    if LLM_PROVIDER == "openai" and not OPENAI_API_KEY:
         fallback_reply = (
             "Ahora mismo AI.D está en modo básico (sin conexión al modelo avanzado). "
             "Igual puedo ayudarte a ordenar tus ideas. Escríbeme 1) tu contexto, "
@@ -2307,14 +2484,6 @@ async def aid_core_chat(request: AIDCoreChatRequest):
             fallback=True,
         )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    # ------------------------------------------------------------------
-    # Construimos prompt en formato JSON estricto
-    # ------------------------------------------------------------------
     history_block = ""
     if request.history:
         joined = []
@@ -2357,37 +2526,27 @@ Devuelve SIEMPRE un JSON válido con esta estructura EXACTA:
 No incluyas explicación ni texto fuera del JSON.
 """
 
-    payload = {
-        "model": "gpt-4.1-mini",
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "Eres AI.D, cerebro central de Ad.AI. Eres estratégico, práctico, "
-                    "respetuoso, motivador y cero vendehumo. Siempre bajas las ideas "
-                    "a pasos concretos."
-                ),
-            },
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Eres AI.D, cerebro central de Ad.AI. Eres estratégico, práctico, "
+                "respetuoso, motivador y cero vendehumo. Siempre bajas las ideas "
+                "a pasos concretos."
+            ),
+        },
+        {"role": "user", "content": user_prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(timeout=80.0) as client_http:
-            r = await client_http.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-            )
+        raw = await call_llm_messages(messages, model="gpt-4.1-mini")
 
-        r.raise_for_status()
-        raw = r.json()["choices"][0]["message"]["content"]
+        if raw is None:
+            raise RuntimeError("LLM sin respuesta")
 
-        # Intentamos parsear el JSON
         try:
             parsed = json.loads(raw)
         except Exception:
-            # Si el modelo no respeta el JSON, igual devolvemos algo útil
             return AIDCoreChatResponse(
                 reply=raw,
                 mode=request.mode,
@@ -2407,7 +2566,6 @@ No incluyas explicación ni texto fuera del JSON.
         )
 
     except Exception as e:
-        # Fallback si hay error en la llamada HTTP
         return AIDCoreChatResponse(
             reply=(
                 "Hubo un error al conectar con el modelo de IA. "
